@@ -1,1 +1,6 @@
-exp/venv
+*venv
+*.pkl
+*/__pycache__
+*.json
+*.claude
+*.png
