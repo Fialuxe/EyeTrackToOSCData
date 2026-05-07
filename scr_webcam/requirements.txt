@@ -1,0 +1,8 @@
+﻿numpy
+opencv-python
+joblib
+torch
+torchvision
+git+https://github.com/ahmednull/l2cs-net.git
+python-osc
+scikit-learn

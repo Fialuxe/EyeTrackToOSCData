@@ -293,8 +293,8 @@ def _detect_screen_size(window_name):
 
 _COLS, _ROWS = 5, 5
 _GRID = [(c / (_COLS - 1), r / (_ROWS - 1)) for r in range(_ROWS) for c in range(_COLS)]
-_MARGIN = 0.08
-_SAMPLES = 50
+_MARGIN = 0.02
+_SAMPLES = 30 # 50 is too much (overwhelms the calibration data)    
 
 
 def run_calibration(cap, calib_file, skip_lissajous=False):

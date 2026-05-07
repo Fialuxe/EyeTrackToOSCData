@@ -19,6 +19,13 @@ except ImportError as e:
     print(f"pythonosc not installed. Run: pip install python-osc", file=sys.stderr)
     sys.exit(1)
 
+# Numpy
+try:
+    import numpy as np
+except ImportError as e:
+    print(f"numpy not installed. Run: pip install numpy", file=sys.stderr)
+    sys.exit(1)
+
 
 # --- OSC Configuration ---
 # 127.0.0.1 is localhost - change if Unity is running on another machine
@@ -45,6 +52,51 @@ screen_width = 1920   # Will be updated by Tkinter
 screen_height = 1080  # Will be updated by Tkinter
 osc_client = None
 
+# --- Filters ---
+class KalmanEMA:
+    """2-D Kalman (position + velocity) -> EMA."""
+    def __init__(self, R: float = 1e-2, q_ratio: float = 0.01, alpha: float = 0.25):
+        Q = R * q_ratio
+        self._F = np.array([[1, 1, 0, 0],
+                            [0, 1, 0, 0],
+                            [0, 0, 1, 1],
+                            [0, 0, 0, 1]], dtype=np.float64)
+        self._H = np.array([[1, 0, 0, 0],
+                            [0, 0, 1, 0]], dtype=np.float64)
+        self._Q = np.eye(4) * Q
+        self._R = np.eye(2) * R
+        self._alpha = alpha
+        self.reset()
+
+    def update(self, x: float, y: float):
+        z = np.array([x, y])
+        if not self._init:
+            self._state = np.array([x, 0.0, y, 0.0])
+            self._cov = np.eye(4)
+            self._init = True
+            self._ex, self._ey = x, y
+            return x, y
+
+        sp = self._F @ self._state
+        cp = self._F @ self._cov @ self._F.T + self._Q
+        S = self._H @ cp @ self._H.T + self._R
+        K = cp @ self._H.T @ np.linalg.inv(S)
+        self._state = sp + K @ (z - self._H @ sp)
+        self._cov = (np.eye(4) - K @ self._H) @ cp
+
+        kx, ky = float(self._state[0]), float(self._state[2])
+        self._ex = self._alpha * kx + (1 - self._alpha) * self._ex
+        self._ey = self._alpha * ky + (1 - self._alpha) * self._ey
+        return self._ex, self._ey
+
+    def reset(self):
+        self._state = np.zeros(4)
+        self._cov = np.eye(4)
+        self._init = False
+        self._ex = self._ey = None
+
+gaze_filter = KalmanEMA(R=1e-2, q_ratio=0.01, alpha=0.25)
+
 
 def gaze_handler(sender, e):
     """
@@ -58,8 +110,15 @@ def gaze_handler(sender, e):
         ny = e.Y / screen_height
         
         # Clamp to bounds to prevent out-of-screen errors
-        current_norm_x = max(0.0, min(1.0, nx))
-        current_norm_y = max(0.0, min(1.0, ny))
+        nx = max(0.0, min(1.0, nx))
+        ny = max(0.0, min(1.0, ny))
+        
+        # Apply filter
+        fx, fy = gaze_filter.update(nx, ny)
+        
+        # Clamp again just in case the filter overshoots
+        current_norm_x = max(0.0, min(1.0, fx))
+        current_norm_y = max(0.0, min(1.0, fy))
 
 
 def update_gui():
