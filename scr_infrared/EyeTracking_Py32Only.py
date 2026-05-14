@@ -1,16 +1,16 @@
 import time
 import os
 import sys
-import tkinter as tk
-
-# pythonnet for Tobii .NET SDK
-import clr
+import argparse
+import ctypes
 
 # 32bits test
-is_32bit = sys.maxsize <= 2**32 -  1
+is_32bit = sys.maxsize <= 2**32 - 1
 if not is_32bit:
     sys.exit("This script requires 32-bit Python environment. if you installed 64-bit python, please install 32-bit python.")
 
+# pythonnet for Tobii .NET SDK
+import clr
 
 # OSC
 try:
@@ -26,9 +26,7 @@ except ImportError as e:
     print(f"numpy not installed. Run: pip install numpy", file=sys.stderr)
     sys.exit(1)
 
-
 # --- OSC Configuration ---
-# 127.0.0.1 is localhost - change if Unity is running on another machine
 OSC_IP = "127.0.0.1"
 OSC_PORT = 8000
 
@@ -46,10 +44,10 @@ except Exception as e:
     sys.exit(1)
 
 # --- Global Variables ---
-current_norm_x = 0.5  # Normalized X (0.0 to 1.0)
-current_norm_y = 0.5  # Normalized Y (0.0 to 1.0)
-screen_width = 1920   # Will be updated by Tkinter
-screen_height = 1080  # Will be updated by Tkinter
+current_norm_x = 0.5
+current_norm_y = 0.5
+screen_width = 0
+screen_height = 0
 osc_client = None
 
 # --- Filters ---
@@ -98,80 +96,85 @@ class KalmanEMA:
 gaze_filter = KalmanEMA(R=1e-2, q_ratio=0.01, alpha=0.25)
 
 
+def get_screen_resolution():
+    """Windows APIを使用して解像度を取得する（Headlessモード用）"""
+    user32 = ctypes.windll.user32
+    return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+
+
 def gaze_handler(sender, e):
-    """
-    Background thread handler called by Tobii whenever new gaze data arrives.
-    """
+    """Tobiiからのデータ受信コールバック"""
     global current_norm_x, current_norm_y
-    
+
     if screen_width > 0 and screen_height > 0:
-        # Normalize to 0.0 ~ 1.0
         nx = e.X / screen_width
         ny = e.Y / screen_height
-        
-        # Clamp to bounds to prevent out-of-screen errors
+
         nx = max(0.0, min(1.0, nx))
         ny = max(0.0, min(1.0, ny))
-        
-        # Apply filter
+
         fx, fy = gaze_filter.update(nx, ny)
-        
-        # Clamp again just in case the filter overshoots
+
         current_norm_x = max(0.0, min(1.0, fx))
         current_norm_y = max(0.0, min(1.0, fy))
 
 
-def update_gui():
-    """
-    Periodic GUI loop that updates the dot and sends OSC data (~60 FPS).
-    """
-    # Frame variables
-    coord_label.config(text=f"Normalized Gaze: X={current_norm_x:.3f}, Y={current_norm_y:.3f}")
-    
-    canvas_w = canvas.winfo_width()
-    canvas_h = canvas.winfo_height()
-    
-    cx = current_norm_x * canvas_w
-    cy = current_norm_y * canvas_h
-    
-    # Redraw standard circle
-    r = 15
-    canvas.coords(gaze_circle, cx - r, cy - r, cx + r, cy + r)
-    
-    # Send OSC (x, y, dummy pupil parameter 0.0)
+def send_osc_data():
+    """OSC送信処理の共通化"""
     if osc_client:
         try:
             osc_client.send_message("/gaze", [float(current_norm_x), float(current_norm_y), 0.0])
         except Exception as e:
             print(f"OSC Send Error: {e}")
-            
-    # Loop back in 16ms
-    root.after(16, update_gui)
+
+
+def update_gui(root, canvas, coord_label, gaze_circle):
+    """GUIモード用のループ"""
+    coord_label.config(text=f"Normalized Gaze: X={current_norm_x:.3f}, Y={current_norm_y:.3f}")
+
+    canvas_w = canvas.winfo_width()
+    canvas_h = canvas.winfo_height()
+    cx = current_norm_x * canvas_w
+    cy = current_norm_y * canvas_h
+
+    r = 15
+    canvas.coords(gaze_circle, cx - r, cy - r, cx + r, cy + r)
+
+    send_osc_data()
+    root.after(16, update_gui, root, canvas, coord_label, gaze_circle)
 
 
 def main():
     global screen_width, screen_height, osc_client
-    global root, coord_label, canvas, gaze_circle
-    
+
+    parser = argparse.ArgumentParser(description="Tobii Gaze OSC Streamer")
+    parser.add_argument("--headless", action="store_true", help="Disable GUI window and run in terminal only")
+    args = parser.parse_args()
+
     print(f"Creating OSC client: {OSC_IP}:{OSC_PORT}")
     osc_client = udp_client.SimpleUDPClient(OSC_IP, OSC_PORT)
 
-    # --- GUI Setup ---
-    root = tk.Tk()
-    root.title("Tobii Gaze OSC Streamer (32bit)")
-    root.geometry("800x600")
-    
-    # Setup correct screen resolution using the Tk root
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
+    if args.headless:
+        # Headlessモードのセットアップ
+        screen_width, screen_height = get_screen_resolution()
+        print(f"Headless mode enabled. Detected Resolution: {screen_width}x{screen_height}")
+    else:
+        # GUIモードのセットアップ
+        import tkinter as tk
+        root = tk.Tk()
+        root.title("Tobii Gaze OSC Streamer (32bit)")
+        root.geometry("800x600")
 
-    coord_label = tk.Label(root, text="Waiting for data...", font=("Arial", 16))
-    coord_label.pack(pady=10)
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
 
-    canvas = tk.Canvas(root, bg="black")
-    canvas.pack(fill=tk.BOTH, expand=True)
+        coord_label = tk.Label(root, text="Waiting for data...", font=("Arial", 16))
+        coord_label.pack(pady=10)
 
-    gaze_circle = canvas.create_oval(0, 0, 0, 0, fill="red", outline="white", width=2)
+        canvas = tk.Canvas(root, bg="black")
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        gaze_circle = canvas.create_oval(0, 0, 0, 0, fill="red", outline="white", width=2)
 
     # --- Tobii Setup ---
     print("Initializing Tobii Host...")
@@ -184,20 +187,27 @@ def main():
         print(f"Failed to start Tobii Host: {e}")
         print("Continuing with dummy data for test purposes...")
 
-    print("Streaming started. Close the window to exit cleanly.")
-
     # --- Start Loops ---
-    update_gui()
-    root.mainloop()
+    if args.headless:
+        print("Streaming started in background. Press Ctrl+C to exit.")
+        try:
+            while True:
+                send_osc_data()
+                time.sleep(0.016)  # ~60FPS
+        except KeyboardInterrupt:
+            print("\nShutting down gracefully...")
+    else:
+        print("Streaming started. Close the window to exit cleanly.")
+        update_gui(root, canvas, coord_label, gaze_circle)
+        root.mainloop()
+        print("Shutting down...")
 
     # --- Shutdown Hook ---
-    print("Shutting down...")
     try:
         host.Dispose()
     except:
         pass
     print("Done.")
-
 
 if __name__ == "__main__":
     main()
