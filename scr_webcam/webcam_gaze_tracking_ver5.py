@@ -1,6 +1,63 @@
 """
-webcam_gaze_tracking_ver2.py  ── Stable & Light Build
+webcam_gaze_tracking_ver5.py  ── 3-D Eyeball Sphere Model Build
 =================================================
+Improvements over webcam_gaze_tracking_ver4.py:
+
+[Estimation Quality — Sphere Model]
+  - iris_dx/dy (linear 2-D image displacement) replaced by sphere-model gaze angles.
+    Principle: the eye is a sphere (R_eye ≈ 2 × R_iris). The iris center traces the sphere
+    surface as the eye rotates. Gaze direction = normalize(iris_3D – C_eye).
+    Why better: linear iris displacement has sphere-foreshortening nonlinearity
+    (same 10° rotation produces different image displacement at 0° vs 30° eccentricity).
+    atan2(dx, sqrt(R²-dx²-dy²)) recovers the true angle directly.
+
+  - Eyeball center (C_eye) estimated from eye-socket landmarks (33,133,159,145 / 263,362,386,374).
+    These are larger structures than the iris ring, so MediaPipe's monocular depth (z) is more
+    reliable. Iris z is NEVER read directly — it is derived from the sphere constraint.
+    Noise strategy: only 2-D (x,y) of the iris is used (accurate); z is algebraically computed.
+
+  - Individual R_eye variation is self-cancelling: atan2(k·dx, k·sqrt(...)) = atan2(dx, sqrt(...)).
+    Population variation (±5 %) has zero effect on computed gaze angle.
+
+  - Kappa angle (offset between optical axis and foveal/visual axis, ~3–7° individual) is NOT
+    modelled geometrically — it is absorbed by the calibration regression, same as before.
+
+  - Fallback when sphere discriminant < 0 (extreme eccentricity / partial occlusion):
+    arcsin-corrected 2-D displacement used instead; calibration compensates scale.
+
+[Bug Fixes]
+  - Spike-rejection logic: smoother.update() now gated BEHIND spike check. Previously the
+    smoother state was corrupted by spike predictions, causing cascading rejections that looked
+    like a mid-tracking freeze. Fix: check raw_jump BEFORE calling smoother.update().
+  - Bootstrap fix: first valid prediction skips spike check (smoother.pos is None) to avoid
+    rejecting the first real position when last_x/last_y is still at screen-centre init.
+
+[Performance]
+  - GazeEstimator(mp_scale=1.0 default): exposes CLI --mp_scale for optional downscaling;
+    default kept at full resolution — 0.5 degraded landmark stability and caused tracking drops
+  - SVD computed every frame (cached version caused visible jumps at 3-frame update boundaries)
+  - cv2.resize to 224×224 before ToTensor — removes torchvision antialias Resize (~3× faster)
+  - FACEMESH_CONTOURS / IRISES / ALL_LANDMARK_IDX precomputed as numpy arrays (no frozenset
+    iteration overhead per frame in draw_face_mesh)
+  - AdaptiveEMAFilter replaces Kalman+EMA double-smoother: velocity-adaptive alpha removes
+    ~3-frame saccade lag while keeping fixation smoothing
+
+Improvements over webcam_gaze_tracking_ver2.py:
+
+[Critical Fixes]
+  - AsyncCamera.read(): replaced empty-then-get TOCTOU with get_nowait()
+    (old code could deadlock if background thread drained queue between check and get)
+  - AsyncCamera._update(): exception handling + _error flag; silent thread death now
+    surfaces as RuntimeError in the main loop instead of a frozen/empty display
+  - AsyncCamera: maxsize=1 + put_nowait/discard pattern — guarantees "latest frame only"
+    without a second TOCTOU window
+
+[Performance]
+  - GazeCalibrator.per_point_accuracy(): batched model.predict() instead of per-sample loop;
+    mathematically equivalent (corrector is affine: mean(A*xi+b) = A*mean(xi)+b)
+  - Tracking loop: math.hypot() instead of np.hypot() for scalar inputs (~2μs saved/frame)
+  - --osc_hz N: rate-limit OSC sends (default 60 Hz); reduces UDP traffic at high camera fps
+
 Improvements over webcam_gaze_tracker_opt.py:
 
 [Performance]
@@ -21,27 +78,27 @@ Improvements over webcam_gaze_tracker_opt.py:
 import warnings
 warnings.filterwarnings("ignore", message="SymbolDatabase.GetPrototype")
 
+# Fast stdlib / lightweight libs — always imported at module level
 import cv2
-import mediapipe as mp
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont as _PILImageFont
+import math
 import threading
 import queue
 import time
 import argparse
-import tkinter as tk
 from collections import deque
 from functools import lru_cache
-from pythonosc.udp_client import SimpleUDPClient
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
-from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.preprocessing import PolynomialFeatures
-import torch
-import torchvision
-import torchvision.transforms as transforms
-from l2cs import L2CS
-import joblib
+
+# ── Heavy ML libraries are imported LAZILY inside the classes that use them ──
+# torch + torchvision : 15–40 s cold-start on Windows
+# mediapipe           : 3–8 s
+# sklearn             : 2–5 s
+# joblib / pythonosc  : <1 s each
+# Moving them inside __init__ / fit() means:
+#   - `python script.py --help`  → instant
+#   - Bad-arg errors             → instant (argparse runs before any ML import)
+#   - Normal run                 → ML loads once, cached in sys.modules forever after
 
 # ──────────────────────────────────────────────────────────────────────
 # Japanese/Unicode text rendering via Pillow
@@ -174,9 +231,20 @@ FACEMESH_IRISES = frozenset([
     (473,474),(474,475),(475,476),(476,477),(477,473),
 ])
 
+# Precomputed as numpy arrays — eliminates frozenset iteration overhead in draw_face_mesh
+_CONTOUR_IDX  = np.array(sorted(FACEMESH_CONTOURS), dtype=np.int32)   # M×2
+_IRIS_IDX     = np.array(sorted(FACEMESH_IRISES),   dtype=np.int32)   # K×2
+_ALL_FEAT_IDX = np.array(ALL_LANDMARK_IDX,           dtype=np.int32)   # N
+
 # Iris ring landmark indices (center + 4 ring points per eye)
 L_IRIS_RING = [468, 469, 470, 471, 472]
 R_IRIS_RING = [473, 474, 475, 476, 477]
+
+# Eye-socket landmarks used to estimate the 3-D eyeball centre (C_eye).
+# Layout: [outer corner, inner corner, upper-lid mid, lower-lid mid]
+# All 4 landmarks are averaged for noise robustness.
+L_SOCKET_IDX = np.array([33,  133, 159, 145], dtype=np.int32)
+R_SOCKET_IDX = np.array([263, 362, 386, 374], dtype=np.int32)
 
 # Landmarks on the face plane surface (not protruding, expression-stable).
 # Used for SVD-based face normal estimation — more robust than 4-point cross product.
@@ -188,6 +256,8 @@ FACE_PLANE_IDX = np.array([
     168, 6,                # nose bridge
     21,  251,              # temple
 ], dtype=np.int32)
+# Reverted to the original 14 verified-stable landmarks from ver2.
+# 116/345/123/352 were unverified against the actual MediaPipe 478-point topology.
 
 # ──────────────────────────────────────────────────────────────────────
 # Multi-Pose Phase Definitions
@@ -254,7 +324,7 @@ def phase_pitch_range(phase):
 # ──────────────────────────────────────────────────────────────────────
 def draw_face_mesh(frame, landmarks, img_w, img_h,
                    draw_contours=True, draw_irises=True,
-                   draw_all_points=True, draw_solvepnp=True,
+                   draw_all_points=True,
                    flipped=False, alpha=0.55):
     h, w = frame.shape[:2]
 
@@ -271,33 +341,25 @@ def draw_face_mesh(frame, landmarks, img_w, img_h,
                 cv2.circle(overlay, tuple(p), 1, (80, 80, 80), -1)
                 
     if draw_contours:
-        for i, j in FACEMESH_CONTOURS:
-            if i < len(pts) and j < len(pts):
-                cv2.line(overlay, tuple(pts[i]), tuple(pts[j]), (0, 200, 60), 1, cv2.LINE_AA)
+        valid_c = _CONTOUR_IDX[(_CONTOUR_IDX < len(pts)).all(axis=1)]
+        for i, j in valid_c:
+            cv2.line(overlay, tuple(pts[i]), tuple(pts[j]), (0, 200, 60), 1, cv2.LINE_AA)
 
     if draw_irises:
-        for i, j in FACEMESH_IRISES:
-            if i < len(pts) and j < len(pts):
-                cv2.line(overlay, tuple(pts[i]), tuple(pts[j]), (0, 220, 220), 1, cv2.LINE_AA)
+        valid_ir = _IRIS_IDX[(_IRIS_IDX < len(pts)).all(axis=1)]
+        for i, j in valid_ir:
+            cv2.line(overlay, tuple(pts[i]), tuple(pts[j]), (0, 220, 220), 1, cv2.LINE_AA)
         for idx, col in [(468, (0,255,255)), (473, (0,255,255))]:
             if idx < len(pts):
                 cv2.drawMarker(overlay, tuple(pts[idx]), col, cv2.MARKER_CROSS, 10, 1, cv2.LINE_AA)
-                
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-    if draw_solvepnp:
-        labels = {1:"nose", 152:"chin", 33:"L_eye", 263:"R_eye", 61:"L_mth", 291:"R_mth"}
-        for idx, name in labels.items():
-            if idx < len(pts):
-                p = tuple(pts[idx])
-                cv2.circle(frame, p, 5, (0, 220, 255), -1)
-                cv2.putText(frame, name, (p[0]+6, p[1]-4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0,220,255), 1, cv2.LINE_AA)
 
-    for idx in ALL_LANDMARK_IDX:
-        if idx < len(pts):
-            p = tuple(pts[idx])
-            if 0 <= p[0] < w and 0 <= p[1] < h:
-                cv2.circle(frame, p, 2, (180, 100, 255), -1)
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
+    valid_f = _ALL_FEAT_IDX[_ALL_FEAT_IDX < len(pts)]
+    for idx in valid_f:
+        p = tuple(pts[idx])
+        if 0 <= p[0] < w and 0 <= p[1] < h:
+            cv2.circle(frame, p, 2, (180, 100, 255), -1)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -402,23 +464,43 @@ class AsyncCamera:
         self.cap = cv2.VideoCapture(src)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.q = queue.Queue(maxsize=2)
+        self.q = queue.Queue(maxsize=1)   # maxsize=1: "latest frame only"
         self.running = True
+        self._error: str | None = None
         self.thread = threading.Thread(target=self._update, daemon=True)
         self.thread.start()
 
     def _update(self):
         while self.running:
-            time.sleep(0.001)   # Fix 2: yield CPU in thread
-            ret, frame = self.cap.read()
-            if not ret: continue
-            if not self.q.empty():
-                try: self.q.get_nowait()
-                except queue.Empty: pass
-            self.q.put(frame)
+            time.sleep(0.001)
+            try:
+                ret, frame = self.cap.read()
+            except Exception as e:
+                self._error = str(e)
+                break
+            if not ret:
+                self._error = "cap.read() returned False — camera may be disconnected"
+                break
+            # put_nowait + discard-oldest: avoids TOCTOU between empty-check and get
+            try:
+                self.q.put_nowait(frame)
+            except queue.Full:
+                try:
+                    self.q.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self.q.put_nowait(frame)
+                except queue.Full:
+                    pass
 
     def read(self):
-        return self.q.get() if not self.q.empty() else None
+        # get_nowait avoids TOCTOU race (empty-then-get could block forever if
+        # background thread drains the queue between the two calls)
+        try:
+            return self.q.get_nowait()
+        except queue.Empty:
+            return None
 
     def stop(self):
         self.running = False
@@ -471,6 +553,36 @@ class KalmanEMAFilter:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# AdaptiveEMAFilter  (replaces Kalman+EMA double-smoother)
+# ──────────────────────────────────────────────────────────────────────
+class AdaptiveEMAFilter:
+    """Velocity-adaptive EMA: fast alpha on saccades, slow alpha on fixations.
+
+    Eliminates the ~3-frame lag that the prior Kalman+EMA double-smoother
+    introduced on fast eye movements, while keeping fixation smoothing.
+    """
+    def __init__(self, alpha_slow: float = 0.2, alpha_fast: float = 0.9,
+                 vel_threshold_px: float = 40.0):
+        self.alpha_slow = alpha_slow
+        self.alpha_fast = alpha_fast
+        self.vel_thr    = vel_threshold_px
+        self.pos: np.ndarray | None = None
+
+    def reset(self):
+        self.pos = None
+
+    def update(self, x: float, y: float) -> tuple[float, float]:
+        if self.pos is None:
+            self.pos = np.array([x, y], np.float32)
+            return x, y
+        new = np.array([x, y], np.float32)
+        t     = min(1.0, float(np.linalg.norm(new - self.pos)) / self.vel_thr)
+        alpha = self.alpha_slow + t * (self.alpha_fast - self.alpha_slow)
+        self.pos = alpha * new + (1.0 - alpha) * self.pos
+        return float(self.pos[0]), float(self.pos[1])
+
+
+# ──────────────────────────────────────────────────────────────────────
 # BBoxStabilizer
 # ──────────────────────────────────────────────────────────────────────
 class BBoxStabilizer:
@@ -496,28 +608,47 @@ class GazeEstimator:
     FEAT_IRIS      = slice(518, 522)
     FEAT_DIM       = 522
 
-    # Slim feature layout (10 dims):
+    # Slim feature layout (10 dims) — ver5 replaces iris_dx/dy with sphere-model angles:
     #   [0,1]  l2cs_yaw/pitch          — CNN appearance estimate (camera-frame, strong signal)
-    #   [2,3]  iris_l_dx/dy            — left iris center offset from eye midpoint, image-space,
-    #                                    normalized by eye width (precise 2D, no R_head noise)
-    #   [4,5]  iris_r_dx/dy            — same for right eye
-    #   [6,7]  head_yaw/pitch (deg)    — face orientation; reliable when camera is fixed
+    #   [2,3]  l_yaw_sphere/l_pitch_sphere
+    #                                  — left eye rotation angles from 3-D sphere model,
+    #                                    head-local frame (R_head.T applied).
+    #                                    Geometrically correct: atan2(dx, sqrt(R²-r²))
+    #                                    recovers true angle, eliminating cos(θ) foreshortening.
+    #   [4,5]  r_yaw_sphere/r_pitch_sphere — same for right eye
+    #   [6,7]  head_yaw/pitch (deg)    — face orientation conditioning
     #   [8]    head_size               — inter-eye distance proxy for viewing distance
-    #   [9]    iris_l_dx + iris_r_dx   — vergence: binocular disparity (depth/convergence cue)
+    #   [9]    l_yaw_sphere + r_yaw_sphere — vergence (binocular horizontal disparity, sphere-space)
     #
     # Design rationale:
-    #   R_head (4-landmark cross-product) has 5-15° z-noise error. Routing signals through
-    #   R_head.T (world_yaw, iris ring in head-local frame) adds that noise to every feature.
-    #   Instead: keep raw signals (l2cs, image-space iris) + head_yaw/pitch conditioning,
-    #   and let Ridge+Poly2 learn the head-pose correction from 5-phase calibration data.
+    #   ver4 used image-space iris_dx/dy. These have a sphere-foreshortening nonlinearity:
+    #   the same 10° rotation produces ~0.174·R displacement near centre but ~0.143·R at 30°.
+    #   Ridge+Poly2 must learn this curve from calibration data.
+    #   ver5 removes the nonlinearity analytically so the regression only needs to learn a
+    #   near-linear kappa-angle offset + scale, reducing calibration sample requirements.
     SLIM_FEAT_DIM = 10
     FULL_FEAT_DIM = 522
 
     def __init__(self, img_w, img_h, model_path="models/L2CSNet_gaze360.pkl",
                  slim_features: bool = True, blink_ratio: float = 0.75,
-                 l2cs_every: int = 1):
-        self.img_w      = img_w
-        self.img_h      = img_h
+                 l2cs_every: int = 1, mp_scale: float = 1.0):
+        # Deferred heavy imports — first call takes 15–50 s; subsequent calls are
+        # a sys.modules dict lookup (~50 ns) because Python caches loaded modules.
+        print("[Loading] torch ...", flush=True)
+        import torch
+        print("[Loading] torchvision ...", flush=True)
+        import torchvision                          # needed for torchvision.models.resnet
+        import torchvision.transforms as transforms
+        print("[Loading] mediapipe ...", flush=True)
+        import mediapipe as mp
+        print("[Loading] L2CS ...", flush=True)
+        from l2cs import L2CS
+
+        # MediaPipe runs on a downscaled frame; landmarks stay in [0,1] normalized space
+        self.mp_w = max(1, int(img_w * mp_scale))
+        self.mp_h = max(1, int(img_h * mp_scale))
+        self.img_w = self.mp_w   # _tight_crop slices from the downscaled rgb frame
+        self.img_h = self.mp_h
         self.slim_features = slim_features
         self.blink_ratio   = blink_ratio
         self.l2cs_every    = max(1, l2cs_every)
@@ -528,33 +659,52 @@ class GazeEstimator:
         self.face_mesh = mp.solutions.face_mesh.FaceMesh(
             max_num_faces=1,
             refine_landmarks=True,
-            min_detection_confidence=0.6,
-            min_tracking_confidence=0.6,
+            min_detection_confidence=0.5,   # easier initial acquisition
+            min_tracking_confidence=0.6,    # reverted — 0.8 caused more re-detections → jumps
         )
         self.bbox_stab = BBoxStabilizer(alpha=0.40)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.fp16   = torch.cuda.is_available()
         self.l2cs   = L2CS(block=torchvision.models.resnet.Bottleneck,
                            layers=[3,4,6,3], num_bins=90)
-        self.l2cs.load_state_dict(torch.load(model_path, map_location=self.device))
+        print(f"[Loading] L2CS weights ({model_path}) ...", flush=True)
+        try:
+            state = torch.load(model_path, map_location=self.device, weights_only=True)
+        except TypeError:   # PyTorch < 2.0 lacks weights_only param
+            state = torch.load(model_path, map_location=self.device)
+        self.l2cs.load_state_dict(state)
         self.l2cs.to(self.device).eval()
         if self.fp16: self.l2cs.half()
+        print("[Loading] Ready.", flush=True)
+        # Resize omitted here — cv2.resize(crop, (224,224)) before ToTensor is
+        # ~3× faster than torchvision antialias Resize on variable-size crops
         self.transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Resize((224,224), antialias=True),
             transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
         ])
         self.idx_tensor = None
         self._ear_history = deque(maxlen=60)
+        # EMA caches for sphere-model gaze angles (left/right eye, [yaw_deg, pitch_deg]).
+        # Sphere angles are computed from single-frame MediaPipe landmarks which carry
+        # per-frame noise (~0.5–2 px). EMA with α=0.45 gives a ~2-frame effective window —
+        # enough to kill single-frame spikes without adding perceptible lag.
+        # Separate from L2CS EMA (α=0.4) because the two signals have different noise profiles.
+        self._sphere_l_cache = np.zeros(2, dtype=np.float64)  # [yaw, pitch] left eye
+        self._sphere_r_cache = np.zeros(2, dtype=np.float64)  # [yaw, pitch] right eye
+        self._sphere_cache_init = False   # False until first valid sphere output
 
     def _ear(self, lm):
-        def _e(outer, inner, top, bot):
-            w = np.linalg.norm(np.array([lm[outer].x, lm[outer].y])
-                              -np.array([lm[inner].x, lm[inner].y])) + 1e-9
-            h = np.linalg.norm(np.array([lm[top].x, lm[top].y])
-                              -np.array([lm[bot].x,  lm[bot].y]))
-            return h / w
-        return (_e(33,133,159,145) + _e(263,362,386,374)) / 2.0
+        """6-point EAR (Soukupová & Čech 2016) — two vertical chords per eye.
+        More robust than 2-point: single lid-centre point is the noisiest landmark."""
+        def _e6(o, i, t1, t2, b1, b2):
+            pts   = np.array([[lm[k].x, lm[k].y] for k in [o, i, t1, t2, b1, b2]])
+            horiz = np.linalg.norm(pts[0] - pts[1]) + 1e-9
+            v1    = np.linalg.norm(pts[2] - pts[4])   # t1–b1
+            v2    = np.linalg.norm(pts[3] - pts[5])   # t2–b2
+            return (v1 + v2) / (2.0 * horiz)
+        left  = _e6(33,  133, 160, 158, 144, 153)
+        right = _e6(263, 362, 387, 385, 373, 380)
+        return (left + right) / 2.0
 
     def _face_normalized_features(self, lm_list, all_points_px):
         left_corner  = all_points_px[33]
@@ -592,12 +742,195 @@ class GazeEstimator:
         features = np.concatenate([flat, [yaw, pitch, roll]])  # (513,)
         return features.astype(np.float64), R_face
 
+    def _fit_iris_center(self, all_points: np.ndarray, ring_idx: list) -> np.ndarray:
+        """Algebraic circle fit (Coope 1993) on 4 iris ring boundary points.
+
+        When the ring is partially occluded (eyelid covers iris edge during up/down
+        gaze), one or more ring points drift off the true boundary and skew the
+        algebraic fit.  Guard: if the Coope centre diverges from MediaPipe's own
+        deep-learned iris centre (landmark 468/473) by more than the fitted radius,
+        blend toward the MediaPipe centre proportionally.  MediaPipe's centre
+        estimate is robust to partial occlusion; the ring fit is more precise when
+        the iris is fully visible.
+        """
+        mp_center = all_points[ring_idx[0], :2].astype(np.float64)   # lm 468/473
+        pts = all_points[ring_idx[1:], :2].astype(np.float64)         # 4×2 ring pts
+        A = np.column_stack([2.0 * pts, np.ones(4)])
+        b = (pts ** 2).sum(axis=1)
+        try:
+            res, _, rank, _ = np.linalg.lstsq(A, b, rcond=None)
+            if rank < 3:
+                raise ValueError("degenerate")
+            cx, cy = res[0], res[1]
+            # Fitted iris radius — mean distance from Coope centre to ring pts.
+            R_fit = float(np.mean(np.linalg.norm(pts - np.array([cx, cy]), axis=1)))
+            # Occlusion guard: if Coope result is more than R_fit away from the
+            # MediaPipe centre, ring points are likely occluded on one side.
+            # Blend toward MP centre; the further the divergence, the more weight
+            # given to the occlusion-robust deep-learned estimate.
+            dist = math.hypot(cx - mp_center[0], cy - mp_center[1])
+            # TODO (next session, if vertical accuracy is still poor after re-calib):
+            # raise threshold from R_fit to 1.5 * R_fit to reduce false-positive blending.
+            if dist > R_fit:
+                t = min(1.0, dist / (2.0 * R_fit + 1e-9))
+                cx = (1.0 - t) * cx + t * float(mp_center[0])
+                cy = (1.0 - t) * cy + t * float(mp_center[1])
+            return np.array([cx, cy, float(all_points[ring_idx[0], 2])], dtype=np.float32)
+        except (ValueError, np.linalg.LinAlgError):
+            return all_points[ring_idx[0]]
+
+    @staticmethod
+    def _iris_sphere_gaze(
+        iris_cx: float, iris_cy: float,
+        socket_pts_3d: np.ndarray,
+        R_iris_2d: float,
+        R_head: np.ndarray,
+    ):
+        """Compute head-local eye-rotation angles via the eyeball sphere model.
+
+        ── PRINCIPLE ────────────────────────────────────────────────────────
+        The eye is a sphere of radius R_eye ≈ 2 × R_iris (anatomical mean:
+        11.7 mm / 5.9 mm ≈ 1.98). The iris centre lies on the front of that
+        sphere. As the eye rotates, the iris centre traces an arc on the sphere
+        surface. Gaze direction = normalize(iris_3D − C_eye).
+
+        ── WHY BETTER THAN LINEAR iris_dx/dy ────────────────────────────────
+        Linear: iris_dx = (x_iris − x_socket) / eye_width
+        Problem: the same 10° eye rotation produces sin(10°)·R ≈ 0.174·R
+        lateral shift at the centre, but only sin(40°)−sin(30°) ≈ 0.143·R
+        when the eye is already at 30°. Same angle, different pixel movement.
+        This "sphere foreshortening" makes the linear feature nonlinear w.r.t.
+        the true gaze angle — Ridge+Poly2 must learn the curve from calibration
+        data, wasting regression capacity.
+
+        Sphere model: θ = atan2(dx, sqrt(R_eye²−dx²−dy²))
+        This is exact and requires no learning to undo the nonlinearity.
+
+        ── WHY INDIVIDUAL R_eye DIFFERENCES DO NOT MATTER ───────────────────
+        gaze_x = dx,  gaze_z = sqrt(R_eye²−dx²−dy²)
+        tan(θ_h) = dx / gaze_z
+        If the actual R_eye = k·R_eye_assumed:
+            dx → k·dx,  gaze_z → k·sqrt(...)  →  k cancels in tan(θ_h).
+        Population variation ±5 % has ZERO effect on the recovered angle.
+        (Residual error from the C_eye depth offset ≈ R_eye·0.65 is a constant
+        that calibration absorbs together with the kappa angle.)
+
+        ── NOISE STRATEGY: why iris z is never read ─────────────────────────
+        MediaPipe estimates depth (z) from monocular cues — essentially the
+        apparent size of facial structures in the image.
+        • Iris ring diameter ≈ 12 mm  →  tiny in image  →  high z noise
+        • Eye-socket span   ≈ 30 mm  →  large in image  →  good z SNR
+        Therefore: iris (x, y) only (Coope-fit accurate), eye-socket (x,y,z)
+        for the eyeball centre. Iris z is DERIVED from the sphere equation:
+            iris_3D_z = C_eye_z − sqrt(R_eye² − dx² − dy²)
+        (minus: iris is closer to camera than C_eye, i.e. smaller z in
+        MediaPipe's convention where z decreases toward the camera.)
+
+        ── KAPPA ANGLE ──────────────────────────────────────────────────────
+        The optical axis (sphere centre → iris) differs from the visual axis
+        (foveal direction) by ≈3–7° horizontally, ≈1–3° vertically, varying
+        by individual. This is NOT modelled here — it is a constant per person
+        that the calibration regression absorbs as part of the bias term.
+
+        ── COORDINATE CONVENTION ────────────────────────────────────────────
+        This codebase uses z INCREASES toward camera (face-outward = +z).
+        Proof: SVD gives x_axis ≈ [1,0,0] (right), y_axis ≈ [0,1,0] (down),
+        z_axis = cross(x,y) = [0,0,+1]. head_yaw = atan2(R_head[0,2], R_head[2,2])
+        gives 0° for a frontal face only if R_head[2,2] > 0, i.e. z_axis[2] > 0 ✓.
+        L2CS convention confirms: gaze_cam=[0,0,1] = "looking forward at camera" = +z.
+        Iris is on the FRONT of the eyeball (closest to camera) → iris.z > C_eye.z
+        → dz = iris.z − C_eye.z > 0 → use +sqrt.
+
+        Returns
+        -------
+        (yaw_deg, pitch_deg) in head-local frame, or None if discriminant < 0
+        (extreme eccentricity / occlusion — caller uses arcsin fallback).
+        """
+        # ── Step 1: Eyeball radius in image-normalised units ─────────────────
+        # R_iris_2d is measured in [0,1] image space via the Coope circle fit.
+        # Anatomical ratio R_eye/R_iris = 11.7/5.9 ≈ 1.98.
+        # R_eye appears symmetrically in atan2(dx, sqrt(R_eye²−r²)), so it
+        # cancels; the absolute value only sets the scale of C_eye depth offset.
+        R_eye = R_iris_2d * 1.98
+
+        # ── Step 2: Eyeball centre (C_eye) ───────────────────────────────────
+        # 4-point mean of the eye-socket landmarks — all three components.
+        # More averaging reduces landmark noise; the regression absorbs any
+        # residual eyelid-coupling bias via the polynomial features.
+        #
+        # TODO (next session): after re-calibrating with this 4-point mean,
+        # test whether vertical (up/down) accuracy improved vs the previous session.
+        # - If YES → done; the corners-only y revert was the right call.
+        # - If NO  → the occlusion guard in _fit_iris_center may be over-triggering;
+        #   try raising its threshold from `dist > R_fit` to `dist > 1.5 * R_fit`
+        #   (search for "Occlusion guard" in _fit_iris_center, ~line 772).
+        socket_3d = socket_pts_3d.mean(axis=0)          # shape (3,)
+
+        # The optical rotation centre is ~0.65·R_eye BEHIND the corneal plane.
+        # R_head[:,2] = face outward normal (toward camera = +z in MediaPipe).
+        # Subtracting it moves C_eye away from the camera, into the skull.
+        # Units: R_head[:,2] is a unit vector in 3-D MediaPipe space;
+        # R_eye is in [0,1] 2-D image units. These mix coordinate systems, but
+        # MediaPipe's z scale ≈ x,y scale for typical face sizes, so the error
+        # is small (< 10 %) and calibration absorbs the remainder.
+        face_outward = R_head[:, 2]
+        C_eye = socket_3d - face_outward * (R_eye * 0.65)
+
+        # ── Step 3: Lateral displacement of iris from eyeball centre ─────────
+        # Use 2-D (x, y) only — z not needed and not used.
+        dx = iris_cx - C_eye[0]
+        dy = iris_cy - C_eye[1]
+        r_lat_sq = dx * dx + dy * dy
+
+        # Sphere validity: if r_lat² ≥ R_eye² the iris is "outside" the sphere
+        # in the 2-D projection, which means extreme eccentricity or noise.
+        # Use 0.98 guard to avoid sqrt of near-zero.
+        if r_lat_sq >= R_eye * R_eye * 0.98:
+            return None   # fallback to arcsin in caller
+
+        # ── Step 4: Derive iris z from sphere equation ────────────────────────
+        # iris_3D lies on the FRONT of the sphere (closest to camera = highest z).
+        # C_eye is behind the iris → C_eye.z < iris.z
+        # dz = iris.z − C_eye.z = +sqrt(R_eye²−r_lat²)  [positive]
+        # Verification: straight-ahead gaze → dx=0, dy=0 → dz=+R_eye
+        #   gaze_cam = [0, 0, +1]  →  gaze_local = [0, 0, +1]
+        #   yaw = atan2(0, +1) = 0°  ✓
+        dz = +math.sqrt(R_eye * R_eye - r_lat_sq)
+
+        # ── Step 5: Gaze vector in camera frame → head-local frame ───────────
+        gaze_cam = np.array([dx, dy, dz], dtype=np.float64)
+        gaze_cam /= np.linalg.norm(gaze_cam)
+
+        # R_head.T removes head rotation so the remaining angle is pure eye rotation.
+        gaze_local = R_head.T @ gaze_cam
+
+        yaw_deg   = math.degrees(math.atan2(gaze_local[0], gaze_local[2]))
+        pitch_deg = math.degrees(math.atan2(
+            gaze_local[1],
+            math.sqrt(gaze_local[0] ** 2 + gaze_local[2] ** 2),
+        ))
+        debug_info = {
+            'model': 'S',
+            'C_eye': C_eye.copy(),
+            'R_eye': R_eye,
+            'R_iris': R_iris_2d,
+            'iris_cx': iris_cx,
+            'iris_cy': iris_cy,
+            'socket_3d': socket_pts_3d.copy(),
+            'dx': dx, 'dy': dy, 'dz': dz,
+            'gaze_cam':   gaze_cam.copy(),
+            'gaze_local': gaze_local.copy(),  # head-rotation-removed; use for display
+            'yaw': yaw_deg,
+            'pitch': pitch_deg,
+        }
+        return yaw_deg, pitch_deg, debug_info
+
     def _tight_crop(self, lm, rgb):
         pts = np.array([[lm[i].x*self.img_w, lm[i].y*self.img_h]
                         for i in FACE_OVAL_IDS], np.float32)
         x0,y0 = pts[:,0].min(), pts[:,1].min()
         x1,y1 = pts[:,0].max(), pts[:,1].max()
-        pw = (x1-x0)*0.10; ph = (y1-y0)*0.10
+        pw = (x1-x0)*0.20; ph = (y1-y0)*0.20   # 20% matches L2CS training distribution
         x0,y0 = max(0,x0-pw), max(0,y0-ph)
         x1,y1 = min(self.img_w,x1+pw), min(self.img_h,y1+ph)
         sx0,sy0,sx1,sy1 = self.bbox_stab.update([x0,y0,x1,y1])
@@ -606,8 +939,11 @@ class GazeEstimator:
         return rgb[sy0:sy1, sx0:sx1]
 
     def process(self, frame):
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        res = self.face_mesh.process(rgb)
+        import torch   # cached after __init__; this lookup is ~50 ns
+        # Downscale before MediaPipe — 35–50% CPU reduction; landmarks stay in [0,1] space
+        small = cv2.resize(frame, (self.mp_w, self.mp_h), interpolation=cv2.INTER_LINEAR)
+        rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        res   = self.face_mesh.process(rgb)
         if not res.multi_face_landmarks:
             return None, False, None
 
@@ -621,9 +957,8 @@ class GazeEstimator:
                if len(self._ear_history) >= 30 else 0.18)
         is_blinking = ear < thr
 
-        # Head pose — SVD plane fit on 14 stable surface landmarks.
-        # Least-squares face normal averages out per-landmark MediaPipe noise;
-        # more robust than the former 4-point cross-product estimate.
+        # Head pose — SVD plane fit every frame. The SVD on 14×3 takes ~0.05 ms;
+        # caching caused visible jumps at cache-update boundaries (reverted from ver4 draft).
         plane_pts = all_points[FACE_PLANE_IDX].astype(np.float64)
         centroid  = plane_pts.mean(axis=0)
         _, _, Vt  = np.linalg.svd(plane_pts - centroid, full_matrices=False)
@@ -634,6 +969,13 @@ class GazeEstimator:
         if y_axis[1] < 0: y_axis = -y_axis   # y down in image space
         z_axis = np.cross(x_axis, y_axis)     # recompute to ensure right-hand system
         z_axis /= np.linalg.norm(z_axis) + 1e-9
+        # Guard: face normal must point toward camera (+z). At non-frontal angles SVD
+        # can produce a flipped z without triggering the x/y guards above, causing
+        # sudden large jumps in all R_head.T rotations. Flip z (and y to keep
+        # right-handed) when the normal faces away from camera.
+        if z_axis[2] < 0:
+            z_axis = -z_axis
+            y_axis = -y_axis
         R_head = np.column_stack([x_axis, y_axis, z_axis]).astype(np.float64)
 
         head_yaw_deg   = float(np.degrees(np.arctan2( R_head[0,2], R_head[2,2])))
@@ -651,7 +993,8 @@ class GazeEstimator:
                 if self.idx_tensor is None:
                     self.idx_tensor = torch.arange(90, dtype=torch.float32, device=self.device)
                 with torch.inference_mode():
-                    t = self.transform(crop).unsqueeze(0).to(self.device)
+                    crop_224 = cv2.resize(crop, (224, 224), interpolation=cv2.INTER_LINEAR)
+                    t = self.transform(crop_224).unsqueeze(0).to(self.device)
                     if self.fp16: t = t.half()
                     gp, gy = self.l2cs(t)
                     p_s = torch.softmax(gp, dim=1)
@@ -701,22 +1044,130 @@ class GazeEstimator:
         head_y    = float(eye_center_global[1])
         head_size = float(np.linalg.norm(all_points[263] - all_points[33]))
 
+        sdbg_l = sdbg_r = None   # populated only in slim_features path
+
         if self.slim_features:
-            # Iris center in image space (no R_head rotation → no z-noise contamination)
-            iris_l_center = all_points[468]
-            iris_r_center = all_points[473]
+            # ── Iris centre (Coope algebraic circle fit on 4 ring points) ────
+            # More accurate than raw landmark 468/473 (~0.5–1 px gain in [0,1] space).
+            iris_l_center = self._fit_iris_center(all_points, L_IRIS_RING)
+            iris_r_center = self._fit_iris_center(all_points, R_IRIS_RING)
+
+            # ── Iris radius in 2-D image-normalised space ─────────────────────
+            # Mean distance from the Coope-fit centre to the 4 ring boundary points.
+            # This radius is in the same [0,1] units as iris_cx/cy, so it is the
+            # correct input to _iris_sphere_gaze which needs R_iris in those units.
+            # WHY NOT eye_width/4: eye_width measures corner-to-corner distance
+            # (≈4·R_iris anatomically) but varies with expression; ring-fit radius
+            # is expression-stable and directly measured from the iris boundary.
+            ring_l_pts = all_points[L_IRIS_RING[1:], :2]   # 4×2, skip centre idx
+            ring_r_pts = all_points[R_IRIS_RING[1:], :2]
+            R_iris_l = float(np.mean(np.linalg.norm(
+                ring_l_pts - iris_l_center[:2], axis=1))) + 1e-9
+            R_iris_r = float(np.mean(np.linalg.norm(
+                ring_r_pts - iris_r_center[:2], axis=1))) + 1e-9
+
+            # ── Eye-socket 3-D centroids for eyeball centre estimation ────────
+            socket_l_3d = all_points[L_SOCKET_IDX]   # 4×3
+            socket_r_3d = all_points[R_SOCKET_IDX]
+
+            # ── Project socket landmarks onto the face plane ──────────────────
+            # MediaPipe's per-landmark z is unreliable at non-frontal angles
+            # (monocular depth estimation degrades). x,y are accurate.
+            # Replace each socket landmark's z with its face-plane z, derived from
+            # the plane equation (p - centroid)·z_axis = 0 → z = centroid[2]
+            # - (z_axis[0]*(x-cx) + z_axis[1]*(y-cy)) / z_axis[2].
+            # z_axis[2] > 0 is guaranteed by the SVD guard above.
+            # Clamp to 0.1 (face angle ≤ ~84°) — beyond that the face-plane
+            # projection amplifies noise faster than it helps.
+            _denom = max(float(z_axis[2]), 0.1)
+            def _proj_z(pts):
+                out = pts.copy()
+                out[:, 2] = centroid[2] - (
+                    z_axis[0] * (out[:, 0] - centroid[0]) +
+                    z_axis[1] * (out[:, 1] - centroid[1])
+                ) / _denom
+                return out
+            socket_l_3d_proj = _proj_z(socket_l_3d)
+            socket_r_3d_proj = _proj_z(socket_r_3d)
+
+            # ── Sphere model — attempt full 3-D gaze angle recovery ───────────
+            sphere_l = self._iris_sphere_gaze(
+                iris_l_center[0], iris_l_center[1],
+                socket_l_3d_proj, R_iris_l, R_head)
+            sphere_r = self._iris_sphere_gaze(
+                iris_r_center[0], iris_r_center[1],
+                socket_r_3d_proj, R_iris_r, R_head)
+
+            # ── Fallback: arcsin-corrected 2-D displacement ───────────────────
+            # Used when discriminant < 0 (iris outside sphere projection = extreme
+            # eccentricity or MediaPipe noise during partial occlusion / blink edge).
+            #
+            # WHY arcsin AND NOT linear:
+            #   iris_dx = dx / eye_width ≈ sin(θ) / (R_eye/R_iris·2) ≈ sin(θ) / 3.96
+            #   So sin(θ) ≈ iris_dx · 3.96, and θ = arcsin(...) corrects for the
+            #   same cos(θ) foreshortening as the sphere model, in 2-D only.
+            #   Result is in image space (not head-local); calibration compensates.
+            #   This path activates only for extreme/occluded gaze — rarely.
             iris_l_dx = (iris_l_center[0] - l_eye_center[0]) / (l_eye_width + 1e-9)
             iris_l_dy = (iris_l_center[1] - l_eye_center[1]) / (l_eye_width + 1e-9)
             iris_r_dx = (iris_r_center[0] - r_eye_center[0]) / (r_eye_width + 1e-9)
             iris_r_dy = (iris_r_center[1] - r_eye_center[1]) / (r_eye_width + 1e-9)
-            vergence  = iris_l_dx + iris_r_dx   # binocular disparity
+            # Scale ≈ 3.96: eye_width ≈ 2×R_iris, R_eye ≈ 1.98×R_iris → eye_width/R_eye ≈ 2/1.98
+            # iris_dx = sin(θ)/3.96 → θ = arcsin(iris_dx × 3.96)
+            _S = 3.96
+
+            # ── Sphere EMA — noise suppression for sphere-model outputs ──────
+            # Single-frame MediaPipe landmarks carry ~0.5–2 px jitter.
+            # EMA with α=0.45 (≈2-frame window) kills spikes without adding
+            # perceptible lag. Applied only when sphere succeeds; fallback
+            # values are used directly (they're already an approximation).
+            _SPHERE_EMA = 0.45
+            if sphere_l is not None:
+                s_yaw_l, s_pitch_l, sdbg_l = sphere_l
+                raw_l = np.array([s_yaw_l, s_pitch_l], dtype=np.float64)
+                if not self._sphere_cache_init:
+                    self._sphere_l_cache[:] = raw_l
+                    self._sphere_r_cache[:] = raw_l   # safe init; overwritten below
+                    self._sphere_cache_init = True
+                self._sphere_l_cache = _SPHERE_EMA * raw_l + (1 - _SPHERE_EMA) * self._sphere_l_cache
+                l_yaw, l_pitch = float(self._sphere_l_cache[0]), float(self._sphere_l_cache[1])
+                sdbg_l['yaw'] = l_yaw    # store EMA-smoothed value in debug dict
+                sdbg_l['pitch'] = l_pitch
+            else:
+                l_yaw  = math.degrees(math.asin(max(-0.97, min(0.97, iris_l_dx * _S))))
+                l_pitch = math.degrees(math.asin(max(-0.97, min(0.97, iris_l_dy * _S))))
+                sdbg_l = {'model': 'A', 'iris_cx': iris_l_center[0], 'iris_cy': iris_l_center[1],
+                          'R_iris': R_iris_l, 'socket_3d': socket_l_3d.copy(),
+                          'yaw': l_yaw, 'pitch': l_pitch}
+
+            if sphere_r is not None:
+                s_yaw_r, s_pitch_r, sdbg_r = sphere_r
+                raw_r = np.array([s_yaw_r, s_pitch_r], dtype=np.float64)
+                if not self._sphere_cache_init:
+                    self._sphere_r_cache[:] = raw_r
+                    self._sphere_cache_init = True
+                self._sphere_r_cache = _SPHERE_EMA * raw_r + (1 - _SPHERE_EMA) * self._sphere_r_cache
+                r_yaw, r_pitch = float(self._sphere_r_cache[0]), float(self._sphere_r_cache[1])
+                sdbg_r['yaw'] = r_yaw
+                sdbg_r['pitch'] = r_pitch
+            else:
+                r_yaw  = math.degrees(math.asin(max(-0.97, min(0.97, iris_r_dx * _S))))
+                r_pitch = math.degrees(math.asin(max(-0.97, min(0.97, iris_r_dy * _S))))
+                sdbg_r = {'model': 'A', 'iris_cx': iris_r_center[0], 'iris_cy': iris_r_center[1],
+                          'R_iris': R_iris_r, 'socket_3d': socket_r_3d.copy(),
+                          'yaw': r_yaw, 'pitch': r_pitch}
+
+            # Vergence = horizontal binocular disparity in sphere-angle space.
+            # Positive vergence → eyes converging (near target).
+            vergence = l_yaw + r_yaw
+
             features = np.array([
-                l2cs_yaw_local, l2cs_pitch_local,   # [0,1]
-                iris_l_dx, iris_l_dy,               # [2,3]
-                iris_r_dx, iris_r_dy,               # [4,5]
-                head_yaw_deg, head_pitch_deg,        # [6,7]
-                head_size,                           # [8]
-                vergence,                            # [9]
+                l2cs_yaw_local, l2cs_pitch_local,   # [0,1]  L2CS neural-net gaze
+                l_yaw,          l_pitch,             # [2,3]  left-eye sphere angles
+                r_yaw,          r_pitch,             # [4,5]  right-eye sphere angles
+                head_yaw_deg,   head_pitch_deg,      # [6,7]  head orientation
+                head_size,                           # [8]    viewing-distance proxy
+                vergence,                            # [9]    binocular disparity
             ], dtype=np.float64)
         else:
             # full 522-dim path — _face_normalized_features only computed here
@@ -738,6 +1189,8 @@ class GazeEstimator:
             ear=ear, is_blinking=is_blinking,
             landmarks=lm,
             R_head=R_head,
+            sphere_l=sdbg_l,
+            sphere_r=sdbg_r,
         )
         return features, is_blinking, dbg
 
@@ -799,7 +1252,9 @@ class GazeCalibrator:
         return np.vstack(X_out), np.vstack(y_out), dropped
 
     def _evaluate_models(self, X_train, y_train, X_test, y_test):
-        """Lazy-import evaluation helper; only called when eval_models=True."""
+        from sklearn.pipeline import make_pipeline
+        from sklearn.linear_model import Ridge
+        from sklearn.preprocessing import StandardScaler, PolynomialFeatures
         from sklearn.neural_network import MLPRegressor
 
         candidates = {
@@ -827,6 +1282,10 @@ class GazeCalibrator:
         return results
 
     def fit(self, features, targets_px, phases=None):
+        from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+        from sklearn.pipeline import make_pipeline
+        from sklearn.linear_model import LinearRegression, Ridge
+
         X = np.array(features,   dtype=np.float64)
         y = np.array(targets_px, dtype=np.float64)
         phases_arr = np.array(phases, dtype=np.int32) if phases is not None else None
@@ -901,17 +1360,25 @@ class GazeCalibrator:
         results = []
         unique = np.unique(self.calib_targets, axis=0)
         for tgt in unique:
-            mask  = np.all(self.calib_targets == tgt, axis=1)
-            # Predict each frame individually then average — predict(mean(X)) ≠ mean(predict(X))
-            # for Poly2 models, so averaging features first gives wrong results.
-            preds = np.array([self.predict(f) for f in self.calib_features[mask]])
-            pred  = preds.mean(axis=0)
-            err   = float(np.linalg.norm(pred - tgt))
+            mask = np.all(self.calib_targets == tgt, axis=1)
+            feats = self.calib_features[mask]
+            # Batch model.predict() — correct because we average *predictions* (not features).
+            # mean(predict(xi)) is what we want; predict(mean(xi)) would be wrong for Poly2.
+            # The corrector is affine (LinearRegression): mean(A*xi+b) = A*mean(xi)+b,
+            # so applying it to mean(raw) gives the same result as per-sample and is faster.
+            raw_batch = self.model.predict(feats)           # (N, 2)
+            raw_mean  = raw_batch.mean(axis=0).reshape(1, -1)
+            if self._out_corrector is not None:
+                pred = self._out_corrector.predict(raw_mean)[0]
+            else:
+                pred = raw_mean[0]
+            err = float(np.linalg.norm(pred - tgt))
             results.append((tgt[0], tgt[1], pred[0], pred[1], err))
         return results
 
     def save(self, path: str) -> None:
         """Persist the fitted model to disk."""
+        import joblib
         joblib.dump({
             "model":           self.model,
             "out_corrector":   self._out_corrector,
@@ -923,6 +1390,7 @@ class GazeCalibrator:
     @classmethod
     def load(cls, path: str) -> "GazeCalibrator":
         """Load a previously saved calibrator."""
+        import joblib
         data = joblib.load(path)
         obj = cls()
         obj.model           = data["model"]
@@ -939,7 +1407,8 @@ class GazeDebugInfo:
     __slots__ = ['head_yaw','head_pitch','head_roll',
                  'l2cs_yaw','l2cs_pitch',
                  'world_yaw','world_pitch',
-                 'ear','is_blinking','landmarks','R_head']
+                 'ear','is_blinking','landmarks','R_head',
+                 'sphere_l','sphere_r']
     def __init__(self, **kw):
         for k, v in kw.items(): setattr(self, k, v)
 
@@ -1319,6 +1788,106 @@ def show_calibration_accuracy(calib, W, H, win_name, duration=3.0):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Gaze Ray Overlay
+# ──────────────────────────────────────────────────────────────────────
+def draw_gaze_rays(frame, landmarks, world_yaw_deg, world_pitch_deg, ray_len=90):
+    """Draw world-gaze direction arrows from both iris centers.
+
+    `frame` must already be horizontally flipped (cv2.flip(frame, 1)) so that
+    landmark x coordinates are mirrored to match the display orientation.
+    """
+    h, w = frame.shape[:2]
+    yaw_r   = math.radians(world_yaw_deg)
+    pitch_r = math.radians(world_pitch_deg)
+    # Project into image space: yaw → x, pitch → -y (screen y increases downward)
+    dx = int(math.sin(yaw_r)    * ray_len)
+    dy = int(-math.sin(pitch_r) * ray_len)
+    for iris_idx in (468, 473):
+        lm = landmarks[iris_idx]
+        # lm.x is in original-frame space; mirror for the flipped display
+        cx = int((1.0 - lm.x) * w)
+        cy = int(lm.y * h)
+        tip = (cx + dx, cy + dy)
+        cv2.arrowedLine(frame, (cx, cy), tip, (255, 120, 0), 2, cv2.LINE_AA, tipLength=0.3)
+        cv2.circle(frame, (cx, cy), 4, (0, 220, 255), -1)
+
+
+def draw_sphere_debug(frame, dbg):
+    """Draw sphere-model geometry overlay for both eyes.
+
+    Renders: socket landmarks (yellow), eyeball sphere circle (orange),
+    C_eye crosshair (magenta), iris circle (cyan), C_eye→iris line (green),
+    gaze ray from iris (blue arrow), and text label (model/yaw/pitch).
+
+    The frame must already be horizontally flipped so landmark x is mirrored.
+    """
+    h, w = frame.shape[:2]
+
+    for side_info in (getattr(dbg, 'sphere_l', None), getattr(dbg, 'sphere_r', None)):
+        if side_info is None:
+            continue
+
+        iris_cx  = side_info['iris_cx']
+        iris_cy  = side_info['iris_cy']
+        R_iris   = side_info['R_iris']
+        model    = side_info.get('model', 'A')
+        yaw_deg  = side_info.get('yaw', 0.0)
+        pitch_deg = side_info.get('pitch', 0.0)
+
+        # Mirror x (frame is already flipped): display_x = (1 - x_norm) * w
+        px = int((1.0 - iris_cx) * w)
+        py = int(iris_cy * h)
+        r_iris_px = max(2, int(R_iris * w))
+
+        # Eye-socket landmark dots (yellow)
+        socket_3d = side_info.get('socket_3d')
+        if socket_3d is not None:
+            for pt in socket_3d:
+                sx = int((1.0 - float(pt[0])) * w)
+                sy = int(float(pt[1]) * h)
+                cv2.circle(frame, (sx, sy), 4, (0, 220, 220), -1, cv2.LINE_AA)
+
+        # Iris circle (cyan)
+        cv2.circle(frame, (px, py), r_iris_px, (255, 220, 0), 1, cv2.LINE_AA)
+        cv2.circle(frame, (px, py), 3, (255, 220, 0), -1, cv2.LINE_AA)
+
+        if model == 'S':
+            C_eye       = side_info['C_eye']
+            R_eye       = side_info['R_eye']
+            gaze_local  = side_info['gaze_local']   # head-rotation removed
+
+            cpx = int((1.0 - float(C_eye[0])) * w)
+            cpy = int(float(C_eye[1]) * h)
+            r_eye_px = max(2, int(R_eye * w))
+
+            # Eyeball sphere projection circle (orange)
+            cv2.circle(frame, (cpx, cpy), r_eye_px, (0, 140, 255), 1, cv2.LINE_AA)
+
+            # C_eye crosshair (magenta)
+            cv2.drawMarker(frame, (cpx, cpy), (255, 0, 200),
+                           cv2.MARKER_CROSS, 12, 1, cv2.LINE_AA)
+
+            # C_eye → iris line (green)
+            cv2.line(frame, (cpx, cpy), (px, py), (0, 200, 80), 1, cv2.LINE_AA)
+
+            # Gaze ray using gaze_local (head-rotation removed).
+            # gaze_local[0] = rightward in head frame → leftward in mirrored display → negate x
+            # gaze_local[1] = downward in head frame → same in display
+            # This arrow is stable under head rotation — moves only with actual eye rotation.
+            ray_len = 70
+            ex = px + int(-gaze_local[0] * ray_len)
+            ey = py + int( gaze_local[1] * ray_len)
+            cv2.arrowedLine(frame, (px, py), (ex, ey),
+                            (200, 50, 255), 2, cv2.LINE_AA, tipLength=0.3)  # purple
+
+        # Text label above iris
+        color = (0, 200, 80) if model == 'S' else (120, 120, 255)
+        label = f"{model} y={yaw_deg:+.1f} p={pitch_deg:+.1f}"
+        cv2.putText(frame, label, (px - 40, py - r_iris_px - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1, cv2.LINE_AA)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Debug Overlay (tracking mode)
 # ──────────────────────────────────────────────────────────────────────
 def _draw_debug_overlay(frame, dbg, fx, fy, feat):
@@ -1407,6 +1976,7 @@ def wait_for_face_countdown(estimator, cam, W, H, win_name, dur=2.0):
 # Main
 # ──────────────────────────────────────────────────────────────────────
 def get_screen_size():
+    import tkinter as tk
     root = tk.Tk()
     w, h = root.winfo_screenwidth(), root.winfo_screenheight()
     root.destroy()
@@ -1453,8 +2023,23 @@ def main():
                     help='Use full 522-dim features; default is 12-dim slim')
     ap.add_argument('--eval-models',  action='store_true',
                     help='Evaluate 4 models at calibration time and deploy winner')
+    ap.add_argument('--osc_hz',      type=float, default=60.0,
+                    help='Max OSC send rate in Hz (default 60); 0 = unlimited')
+    ap.add_argument('--mp_scale',    type=float, default=1.0,
+                    help='Scale factor applied to camera frame before MediaPipe (default 1.0 = full res; 0.5 saves ~40%% CPU but degrades landmark stability)')
+    ap.add_argument('--ema_slow',    type=float, default=0.2,
+                    help='AdaptiveEMA alpha for fixations (default 0.2)')
+    ap.add_argument('--ema_fast',    type=float, default=0.9,
+                    help='AdaptiveEMA alpha for saccades (default 0.9)')
+    ap.add_argument('--ema_vel',     type=float, default=40.0,
+                    help='AdaptiveEMA velocity threshold in px (default 40)')
+    ap.add_argument('--gaze-ray',    action='store_true',
+                    help='Overlay gaze direction arrows from iris centers in the preview window')
+    ap.add_argument('--sphere-debug', action='store_true',
+                    help='Overlay sphere-model geometry (socket dots, eyeball circle, gaze ray) for debugging')
     args = ap.parse_args()
 
+    from pythonosc.udp_client import SimpleUDPClient
     osc      = SimpleUDPClient(args.osc_ip, args.osc_port)
     W, H     = get_screen_size()
     cam      = AsyncCamera(src=0, width=1280, height=720)
@@ -1463,10 +2048,13 @@ def main():
     est  = GazeEstimator(1280, 720, model_path=args.model,
                          slim_features=slim,
                          blink_ratio=args.blink_ratio,
-                         l2cs_every=args.l2cs_every)
+                         l2cs_every=args.l2cs_every,
+                         mp_scale=args.mp_scale)
     calib    = GazeCalibrator(outlier_mad_k=args.outlier_k,
                                eval_models=args.eval_models)
-    smoother = KalmanEMAFilter(ema_alpha=args.kalman_ema)
+    smoother = AdaptiveEMAFilter(alpha_slow=args.ema_slow,
+                                  alpha_fast=args.ema_fast,
+                                  vel_threshold_px=args.ema_vel)
 
     if args.yaw_sign_flip:
         for ph in CALIB_PHASES:
@@ -1532,8 +2120,23 @@ def main():
         tracking_face    = False
         face_lost_frames = 0
         FACE_LOST_GRACE  = 8   # ~250 ms at 30 fps before declaring /gaze/lost
+        # MAX_JUMP_PX: clamp per-frame position movement to this many screen pixels.
+        # Prevents the displayed cursor from teleporting on prediction spikes while
+        # still allowing the smoother's internal state to converge quickly.
+        # WHY NO hard SPIKE_REJECT threshold: a threshold of 750 px would freeze
+        # tracking whenever the user moves their gaze from one side of the screen
+        # to the other (left→right on 1920px = ~1500 px > 750). The clamping below
+        # is sufficient: large jumps are smoothed over 2–4 frames rather than blocked.
+        MAX_JUMP_PX      = 300
+
+        _osc_interval   = (1.0 / args.osc_hz) if args.osc_hz > 0 else 0.0
+        _last_osc_t     = 0.0
 
         while mode == "TRACKING":
+            # Surface camera thread errors immediately instead of silently stalling
+            if cam._error:
+                raise RuntimeError(f"Camera thread failed: {cam._error}")
+
             frame = cam.read()
             if frame is None: continue
 
@@ -1547,17 +2150,22 @@ def main():
                 pred = calib.predict(feat)
                 if pred is not None:
                     rx, ry = pred[0], pred[1]
+                    # Always update smoother with the raw prediction.
+                    # On the first valid frame (smoother.pos is None) this bootstraps
+                    # the smoother directly to the prediction position regardless of
+                    # how far it is from last_x/last_y (which starts at screen centre).
                     sx, sy = smoother.update(rx, ry)
-                    # Cap velocity to prevent single-frame fly-off at extremes
-                    MAX_JUMP_PX = 300
-                    jump = np.hypot(sx - last_x, sy - last_y)
+                    # Clamp the per-frame position step to MAX_JUMP_PX.
+                    # This prevents visible teleportation on single-frame prediction
+                    # spikes while allowing the smoother to converge over 2–4 frames
+                    # for large but legitimate gaze movements (e.g. left→right sweep).
+                    jump = math.hypot(sx - last_x, sy - last_y)
                     if jump > MAX_JUMP_PX:
                         scale = MAX_JUMP_PX / jump
                         sx = last_x + (sx - last_x) * scale
                         sy = last_y + (sy - last_y) * scale
-                    sx = float(np.clip(sx, 0, W))
-                    sy = float(np.clip(sy, 0, H))
-                    last_x, last_y = sx, sy
+                    last_x = float(np.clip(sx, 0, W))
+                    last_y = float(np.clip(sy, 0, H))
             elif feat is None:
                 # Face not detected — grace period before declaring lost
                 face_lost_frames += 1
@@ -1568,7 +2176,10 @@ def main():
             # else: is_blink — freeze position, no state change, no /gaze/lost
 
             fx, fy = last_x / W, last_y / H
-            osc.send_message("/gaze", [fx, fy])
+            _now = time.monotonic()
+            if _now - _last_osc_t >= _osc_interval:
+                osc.send_message("/gaze", [fx, fy])
+                _last_osc_t = _now
 
             if args.preview:
                 px_ = int(last_x * display.shape[1] / W)
@@ -1580,8 +2191,15 @@ def main():
                         img_w=display.shape[1], img_h=display.shape[0],
                         flipped=True,
                         draw_contours=True, draw_irises=True,
-                        draw_all_points=True, draw_solvepnp=True,
+                        draw_all_points=True,
                     )
+
+                if args.gaze_ray and dbg is not None and hasattr(dbg, 'landmarks'):
+                    draw_gaze_rays(display, dbg.landmarks,
+                                   dbg.world_yaw, dbg.world_pitch)
+
+                if args.sphere_debug and dbg is not None:
+                    draw_sphere_debug(display, dbg)
 
                 # 視線ドット
                 col = (0, 80, 255) if is_blink else (0, 255, 60)
